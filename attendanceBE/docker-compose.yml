@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  attendance-api:
+    container_name: attendance-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    image: quantruong12112003/attendance-express:latest
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 3031
+    ports:
+      - "3031:3031"
+    restart: unless-stopped
