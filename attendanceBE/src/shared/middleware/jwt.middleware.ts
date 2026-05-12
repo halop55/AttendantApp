@@ -1,10 +1,4 @@
 import type { NextFunction, Request, Response } from "express";
-import {
-  createRemoteJWKSet,
-  decodeJwt,
-  jwtVerify,
-  type JWTPayload,
-} from "jose";
 import { env } from "../../config/env";
 
 type AuthInfo = {
@@ -33,13 +27,6 @@ class AuthorizationError extends Error {
   }
 }
 
-const logtoJwks = createRemoteJWKSet(new URL(`${env.LOGTO_ENDPOINT}/oidc/jwks`));
-const firebaseJwks = createRemoteJWKSet(
-  new URL(
-    "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
-  ),
-);
-
 function extractBearerToken(req: Request): string {
   const value = req.headers.authorization;
 
@@ -50,26 +37,26 @@ function extractBearerToken(req: Request): string {
   if (!value.startsWith("Bearer ")) {
     throw new AuthorizationError(
       'Authorization header must start with "Bearer "',
-      401,
+      401
     );
   }
 
   return value.slice("Bearer ".length);
 }
 
-function parseAudience(aud: JWTPayload["aud"]): string[] {
-  if (Array.isArray(aud)) return aud;
+function parseAudience(aud: unknown): string[] {
+  if (Array.isArray(aud)) return aud.filter((v): v is string => typeof v === "string");
   if (typeof aud === "string") return [aud];
   return [];
 }
 
-function parseScopes(payload: JWTPayload): string[] {
+function parseScopes(payload: any): string[] {
   const scope = payload.scope;
   if (typeof scope !== "string") return [];
   return scope.split(" ").filter(Boolean);
 }
 
-function verifyLogtoPayload(payload: JWTPayload, requiredScopes: string[]) {
+function verifyPayload(payload: any, requiredScopes: string[]) {
   const audiences = parseAudience(payload.aud);
   const scopes = parseScopes(payload);
 
@@ -87,10 +74,10 @@ function verifyLogtoPayload(payload: JWTPayload, requiredScopes: string[]) {
   }
 }
 
-function toAuthInfo(payload: JWTPayload): AuthInfo {
+function toAuthInfo(payload: any): AuthInfo {
   const scopes = parseScopes(payload);
   const audience = parseAudience(payload.aud);
-  const user: any = payload?.user;
+  const user = payload?.user;
 
   return {
     sub: payload.sub as string,
@@ -108,50 +95,6 @@ function toAuthInfo(payload: JWTPayload): AuthInfo {
   };
 }
 
-function toFirebaseAuthInfo(payload: JWTPayload): AuthInfo {
-  const firebaseInfo = payload.firebase as
-    | { sign_in_provider?: unknown }
-    | undefined;
-
-  return {
-    sub: payload.sub as string,
-    email: typeof payload.email === "string" ? payload.email : undefined,
-    clientId:
-      typeof firebaseInfo?.sign_in_provider === "string"
-        ? firebaseInfo.sign_in_provider
-        : "firebase",
-    organizationId: undefined,
-    scopes: ["attendance:read", "attendance:write"],
-    audience: parseAudience(payload.aud),
-  };
-}
-
-async function verifyFirebaseToken(token: string) {
-  const { payload } = await jwtVerify(token, firebaseJwks, {
-    audience: env.FIREBASE_PROJECT_ID,
-    issuer: `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,
-  });
-
-  if (!payload.sub) {
-    throw new AuthorizationError("Invalid Firebase token subject", 401);
-  }
-
-  if (typeof payload.email !== "string" || payload.email.trim().length === 0) {
-    throw new AuthorizationError("Firebase token email is missing", 401);
-  }
-
-  return toFirebaseAuthInfo(payload);
-}
-
-async function verifyLogtoToken(token: string, requiredScopes: string[]) {
-  const { payload } = await jwtVerify(token, logtoJwks, {
-    issuer: `${env.LOGTO_ENDPOINT}/oidc`,
-  });
-
-  verifyLogtoPayload(payload, requiredScopes);
-  return toAuthInfo(payload);
-}
-
 function createDevAuth(): AuthInfo {
   return {
     sub: "dev-user-001",
@@ -166,19 +109,24 @@ function createDevAuth(): AuthInfo {
 export function verifyAccessToken(requiredScopes: string[] | undefined = []) {
   return async function (req: Request, res: Response, next: NextFunction) {
     try {
-      // Dev mode: allow local frontend and Supabase testing without tokens.
-      if (process.env.BYPASS_AUTH === "true" && !req.headers.authorization) {
+      if (process.env.BYPASS_AUTH === "true") {
         req.auth = createDevAuth();
         return next();
       }
 
       const token = extractBearerToken(req);
-      const decodedPayload = decodeJwt(token);
-      const issuer = typeof decodedPayload.iss === "string" ? decodedPayload.iss : "";
 
-      req.auth = issuer.startsWith("https://securetoken.google.com/")
-        ? await verifyFirebaseToken(token)
-        : await verifyLogtoToken(token, requiredScopes);
+      const jose = await import("jose");
+      const jwks = jose.createRemoteJWKSet(
+        new URL(`${env.LOGTO_ENDPOINT}/oidc/jwks`)
+      );
+
+      const { payload } = await jose.jwtVerify(token, jwks, {
+        issuer: `${env.LOGTO_ENDPOINT}/oidc`,
+      });
+
+      verifyPayload(payload, requiredScopes);
+      req.auth = toAuthInfo(payload);
 
       return next();
     } catch (error) {
